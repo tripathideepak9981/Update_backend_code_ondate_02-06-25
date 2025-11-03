@@ -1,19 +1,29 @@
-# app/utils/db_helpers.py
+# app/utils/db_helpers.py 
 import os
 import pandas as pd
 import sqlalchemy
 from sqlalchemy import text
 from app.config import MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_DATABASE
 from app.state import get_user_state
-from fastapi import Depends
-from fastapi import HTTPException
+from fastapi import Depends, HTTPException
+from typing import List, Union
+from sqlalchemy.engine import Engine
+import logging
+
+logger = logging.getLogger("db_helpers")
+logger.setLevel(logging.INFO)
 
 
+# ============================================================
+# 🔁 Refresh Table Data (For both MySQL / Vertica)
+# ============================================================
 def refresh_tables(connection, table_names, original_table_names) -> None:
     if connection is None:
         print("Cannot refresh tables: connection is None.")
         return
+
     if hasattr(connection, "cursor"):
+        # MySQL raw connection
         engine = sqlalchemy.create_engine(
             f"mysql+mysqlconnector://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}/{MYSQL_DATABASE}"
         )
@@ -37,25 +47,12 @@ def refresh_tables(connection, table_names, original_table_names) -> None:
                     idx = next(i for i, (name, _) in enumerate(table_names) if name == tbl_name)
                     table_names[idx] = (tbl_name, df)
     else:
-        dialect_name = ""
-        if hasattr(connection, "engine"):
-            dialect_name = connection.engine.dialect.name
+        # SQLAlchemy connections
+        dialect_name = getattr(connection.engine.dialect, "name", "")
         if dialect_name == "mysql":
             query = text("SHOW TABLES;")
             result = connection.execute(query)
             db_tables = result.fetchall()
-            for tbl in db_tables:
-                tbl_name = tbl[0]
-                try:
-                    df = pd.read_sql_query(f"SELECT * FROM `{tbl_name}`", connection)
-                except Exception as e:
-                    print(f"Error loading table '{tbl_name}': {e}")
-                    continue
-                if tbl_name not in [tn for tn, _ in table_names]:
-                    table_names.append((tbl_name, df))
-                else:
-                    idx = next(i for i, (name, _) in enumerate(table_names) if name == tbl_name)
-                    table_names[idx] = (tbl_name, df)
         else:
             query = text(
                 "SELECT table_name FROM v_catalog.tables "
@@ -64,78 +61,53 @@ def refresh_tables(connection, table_names, original_table_names) -> None:
             )
             result = connection.execute(query)
             db_tables = [(row[0],) for row in result.fetchall()]
-            for tbl in db_tables:
-                tbl_name = tbl[0]
-                try:
-                    df = pd.read_sql_query(f"SELECT * FROM `{tbl_name}`", connection)
-                except Exception as e:
-                    print(f"Error loading table '{tbl_name}': {e}")
-                    continue
-                if tbl_name not in [tn for tn, _ in table_names]:
-                    table_names.append((tbl_name, df))
-                else:
-                    idx = next(i for i, (name, _) in enumerate(table_names) if name == tbl_name)
-                    table_names[idx] = (tbl_name, df)
+
+        for tbl in db_tables:
+            tbl_name = tbl[0]
+            try:
+                df = pd.read_sql_query(f"SELECT * FROM `{tbl_name}`", connection)
+            except Exception as e:
+                print(f"Error loading table '{tbl_name}': {e}")
+                continue
+            if tbl_name not in [tn for tn, _ in table_names]:
+                table_names.append((tbl_name, df))
+            else:
+                idx = next(i for i, (name, _) in enumerate(table_names) if name == tbl_name)
+                table_names[idx] = (tbl_name, df)
 
 
-from typing import List, Union
-from sqlalchemy.engine import Engine
-from sqlalchemy import text
-from app.config import MYSQL_DATABASE
-import logging
-
-logger = logging.getLogger("list_tables")
-logger.setLevel(logging.INFO)
-
+# ============================================================
+# 📋 List Tables (MySQL / Vertica)
+# ============================================================
 def list_tables(connection: Union[Engine, any]) -> List[str]:
     """
-    Returns a list of user tables from a database connection.
-    Supports MySQL (via SQLAlchemy or raw) and Vertica (SQLAlchemy).
-    Automatically handles schema detection for Vertica.
-
-    Args:
-        connection: SQLAlchemy engine or raw DBAPI connection
-
-    Returns:
-        List[str]: Fully qualified table names (schema.table) for Vertica,
-                   and simple table names for MySQL
+    Returns a list of tables for MySQL or Vertica connections.
     """
     try:
-        # ✅ Case 1: MySQL native (raw DBAPI, like pymysql or mysql.connector)
+        # ✅ Case 1: MySQL raw connector
         if hasattr(connection, "cursor") and "mysql" in str(type(connection)).lower():
-            try:
-                cursor = connection.cursor()
-                db_name = getattr(connection, "database", MYSQL_DATABASE)
-                logger.info(f"[MySQL - raw] Listing tables from DB: {db_name}")
-                cursor.execute(
-                    """
-                    SELECT TABLE_NAME 
-                    FROM INFORMATION_SCHEMA.TABLES 
-                    WHERE TABLE_SCHEMA = %s;
-                    """,
-                    (db_name,)
-                )
-                tables = cursor.fetchall()
-                return [table[0] for table in tables]
-            finally:
-                cursor.close()
+            cursor = connection.cursor()
+            db_name = getattr(connection, "database", MYSQL_DATABASE)
+            cursor.execute(
+                """
+                SELECT TABLE_NAME 
+                FROM INFORMATION_SCHEMA.TABLES 
+                WHERE TABLE_SCHEMA = %s;
+                """,
+                (db_name,),
+            )
+            tables = cursor.fetchall()
+            cursor.close()
+            return [table[0] for table in tables]
 
-        # ✅ Case 2: SQLAlchemy engine (MySQL / Vertica)
+        # ✅ Case 2: SQLAlchemy engine
         elif hasattr(connection, "connect"):
             with connection.connect() as conn:
-                # Detect SQL dialect
-                if hasattr(conn, "engine"):
-                    dialect = conn.engine.dialect.name.lower()
-                elif hasattr(connection, "dialect"):
-                    dialect = connection.dialect.name.lower()
-                else:
-                    dialect = "unknown"
-
+                dialect = conn.engine.dialect.name.lower()
                 logger.info(f"[SQLAlchemy] Detected dialect: {dialect}")
-                db_name = connection.url.database if hasattr(connection, "url") else MYSQL_DATABASE
 
                 if dialect == "mysql":
-                    logger.info(f"[MySQL - ORM] Using schema: {db_name}")
+                    db_name = connection.url.database
                     query = text(
                         "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = :schema"
                     )
@@ -153,7 +125,6 @@ def list_tables(connection: Union[Engine, any]) -> List[str]:
                             WHERE is_system_schema = false
                         """)
                         schemas = [row[0] for row in conn.execute(schema_query).fetchall()]
-                        logger.info(f"[Vertica] Available schemas: {schemas}")
                     except Exception as e:
                         logger.error(f"[Vertica] Failed to fetch schemas: {e}")
                         return []
@@ -186,73 +157,114 @@ def list_tables(connection: Union[Engine, any]) -> List[str]:
         return []
 
 
+# ============================================================
+# 🔌 Main Connection Function (MySQL / Vertica)
+# ============================================================
+import logging
+from fastapi import HTTPException
 
-def get_personal_engine(db_type: str, host: str, user: str, password: str, database: str, port: int):
-    try:
-        if db_type.lower().startswith("vert"):
-            port = port or 5433
-            sqlalchemy.dialects.registry.register("vertica.vertica_python", "vertica_sqlalchemy.dialect", "VerticaDialect")
-            engine_url = f"vertica+vertica_python://{user}:{password}@{host}:{port}/{database}"
-        elif db_type.lower() == "mysql":
-            port = port or 3306
-            engine_url = f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{database}?buffered=true"
-        else:
-            port = port or 5432
-            engine_url = f"{db_type}://{user}:{password}@{host}:{port}/{database}"
-        engine = sqlalchemy.create_engine(engine_url)
-        with engine.connect() as connection:
-            print(f"Connected to {db_type.upper()} database successfully!")
-        return engine
-    except Exception as e:
-        print(f"Error connecting to {db_type} DB: {e}")
-        return None
+logger = logging.getLogger(__name__)
+
+
+from sqlalchemy.engine import URL
 
 def connect_personal_db(db_type, host, user, password, database, port=3306):
+    """
+    Create and validate a connection to either MySQL or Vertica.
+    Uses sqlalchemy.engine.URL.create to avoid URL-encoding issues with special chars.
+    """
+    from sqlalchemy import create_engine, text
+    import traceback
+    import logging
+    from fastapi import HTTPException
+
+    logger = logging.getLogger("connect_personal_db")
+    logger.setLevel(logging.INFO)
+
     try:
-        if db_type.lower() == "mysql":
-            import pymysql
-            from sqlalchemy import create_engine
-            url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
-            return create_engine(url)
+        db_type_l = str(db_type).lower()
 
-        elif db_type.lower() == "vertica":
-            import vertica_python
-            conn_info = {
-                "host": host,
-                "port": port or 5433,
-                "user": user,
-                "password": password,
-                "database": database,
-                "connection_timeout": 10,
-                "read_timeout": 10,
-                "unicode_error": 'strict',
-                "ssl": False
-            }
-            return vertica_python.connect(**conn_info)
+        # -----------------------------
+        # MySQL
+        # -----------------------------
+        if db_type_l == "mysql":
+            # Build a proper URL object (avoids manual percent-encoding)
+            url = URL.create(
+                drivername="mysql+mysqlconnector",
+                username=str(user),
+                password=str(password),
+                host=str(host),
+                port=int(port) if port else 3306,
+                database=str(database),
+            )
+            engine = create_engine(url, pool_pre_ping=True)
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1;"))
+            logger.info(f"✅ MySQL connection OK for DB: {database}")
+            return engine
 
+        # -----------------------------
+        # Vertica
+        # -----------------------------
+        elif db_type_l == "vertica":
+            # Registering vertica dialect might be needed in some environments;
+            # if you already have vertica_sqlalchemy installed this is optional.
+            try:
+                import sqlalchemy.dialects
+                sqlalchemy.dialects.registry.register(
+                    "vertica.vertica_python", "vertica_sqlalchemy.dialect", "VerticaDialect"
+                )
+            except Exception:
+                # Not fatal — registration may already exist
+                logger.debug("Vertica dialect registration skipped/failed (might already exist).")
+
+            url = URL.create(
+                drivername="vertica+vertica_python",
+                username=str(user),
+                password=str(password),
+                host=str(host),
+                port=int(port) if port else 5433,
+                database=str(database),
+            )
+
+            # use connect_args to control tlsmode if your Vertica server needs it
+            engine = create_engine(url, connect_args={"tlsmode": "disable"})
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT version();"))
+                logger.info(f"✅ Vertica connection OK for DB: {database}")
+                return engine
+            except Exception as e:
+                logger.error(f"❌ Vertica DB connection failed: {e}\n{traceback.format_exc()}")
+                raise HTTPException(
+                    status_code=400,
+                    detail="⚠️ Could not establish Vertica connection. Please verify host, port, username, password, and database name."
+                )
+
+        # -----------------------------
+        # Unsupported
+        # -----------------------------
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported DB type: {db_type}")
 
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        print(f"❌ Error connecting to user DB: {e}\n{tb}")
+        logger.error(f"❌ General DB connection error: {e}\n{traceback.format_exc()}")
         raise HTTPException(
-            status_code=500,
-            detail=f"❌ Database connection failed: {str(e)}"
+            status_code=400,
+            detail=f"⚠️ Could not establish {db_type.upper()} connection. Please verify host, port, username, password, and database name."
         )
 
 
+# ============================================================
+# 📦 Load Tables from DB
+# ============================================================
 def load_tables_from_personal_db(engine, table_list: list) -> tuple:
     loaded_tables = []
     original_tables = []
     dialect = engine.url.get_dialect().name.lower() if engine.url.get_dialect() else ""
     for tbl in table_list:
         try:
-            if dialect == "vertica":
-                query = f"SELECT * FROM {tbl}"
-            else:
-                query = f"SELECT * FROM `{tbl}`"
+            query = f"SELECT * FROM {tbl}" if dialect == "vertica" else f"SELECT * FROM `{tbl}`"
             df = pd.read_sql_query(query, con=engine)
             df.columns = [col.strip().replace(" ", "_").lower() for col in df.columns]
             original_df = df.copy()
@@ -264,6 +276,10 @@ def load_tables_from_personal_db(engine, table_list: list) -> tuple:
             print(f"Error loading table '{tbl}': {e}")
     return loaded_tables, original_tables
 
+
+# ============================================================
+# ❌ Disconnect Database
+# ============================================================
 def disconnect_database(user_state):
     if getattr(user_state, "personal_engine", None):
         try:

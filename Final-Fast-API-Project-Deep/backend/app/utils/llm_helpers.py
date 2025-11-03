@@ -476,8 +476,6 @@ EXPLANATION:
 This shows only the districts where total admissions are above the average of all district totals.
     '''.strip()
 
-
-
 def generate_non_sql_response(user_query: str, overview_stats: str, sample_df: pd.DataFrame, llm_instance) -> dict:
     try:
         preview_md = sample_df.iloc[:5, :5].to_markdown(index=False) if not sample_df.empty else ""

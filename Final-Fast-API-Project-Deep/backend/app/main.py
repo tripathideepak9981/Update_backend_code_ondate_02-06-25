@@ -26,11 +26,9 @@ app = FastAPI(title="AI Data Analysis Chatbot API")
 # ---------------- MIDDLEWARE ---------------- #
 app.add_middleware(
     CORSMiddleware,
-<<<<<<< HEAD
+
     allow_origins=["http://localhost:5173"],  # Set correct frontend origin
-=======
-    allow_origins=["*"],  # Set correct frontend origin
->>>>>>> 1444a5104f27541c334a187f9ebf852567db70bc
+
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
